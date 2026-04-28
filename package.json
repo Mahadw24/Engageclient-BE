@@ -1,0 +1,27 @@
+{
+  "name": "server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file=.env --watch src/index.js",
+    "start": "node src/index.js",
+    "setup:sandbox": "node --env-file=.env src/scripts/setup-sandbox.js",
+    "create:superadmin": "node --env-file=.env src/scripts/create-superadmin.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.2",
+    "@fastify/formbody": "^8.0.2",
+    "@fastify/jwt": "^10.0.0",
+    "@langchain/core": "^1.1.31",
+    "@langchain/openai": "^1.2.12",
+    "bcrypt": "^6.0.0",
+    "fastify": "^5.2.1",
+    "fastify-raw-body": "^5.0.0",
+    "jsonwebtoken": "^9.0.3",
+    "langchain": "^1.2.30",
+    "mongoose": "^9.2.4",
+    "openai": "^6.27.0",
+    "stripe": "^20.4.1",
+    "twilio": "^5.12.2"
+  }
+}
