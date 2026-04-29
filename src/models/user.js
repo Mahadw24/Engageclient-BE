@@ -8,7 +8,7 @@ const userSchema = new mongoose.Schema(
     password: { type: String, required: true, minlength: 6 },
     role: {
       type: String,
-      enum: ['owner', 'admin', 'manager', 'agent', 'viewer'],
+      enum: ['owner', 'admin', 'agent', 'viewer'],
       default: 'owner',
     },
     agencyId: { type: mongoose.Schema.Types.ObjectId, ref: 'Agency' },

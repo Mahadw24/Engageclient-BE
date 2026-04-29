@@ -1,55 +1,60 @@
 import mongoose from 'mongoose'
 
-const messageSchema = new mongoose.Schema({
-  direction: { type: String, enum: ['inbound', 'outbound'], required: true },
-  body: { type: String, required: true },
-  twilioSid: { type: String },
-  status: {
-    type: String,
-    enum: ['queued', 'sent', 'delivered', 'read', 'failed'],
-    default: 'queued',
+const messageSchema = new mongoose.Schema(
+  {
+    direction: { type: String, enum: ['inbound', 'outbound'], required: true },
+    body: { type: String, required: true },
+    type: {
+      type: String,
+      enum: ['text', 'image', 'audio', 'document', 'template'],
+      default: 'text',
+    },
+    mediaUrl: { type: String },
+    waMessageId: { type: String }, // Meta message ID
+    status: {
+      type: String,
+      enum: ['sent', 'delivered', 'read', 'failed'],
+      default: 'sent',
+    },
+    sender: {
+      type: String,
+      enum: ['customer', 'ai', 'agent'],
+      default: 'customer',
+    },
+    timestamp: { type: Date, default: Date.now },
   },
-  sender: {
-    type: String,
-    enum: ['customer', 'ai', 'agent'],
-    default: 'customer',
-  },
-  mediaUrls: [{ type: String }],
-  timestamp: { type: Date, default: Date.now },
-})
+  { _id: false }
+)
 
 const conversationSchema = new mongoose.Schema(
   {
     agencyId: { type: mongoose.Schema.Types.ObjectId, ref: 'Agency', required: true },
-    numberId: { type: mongoose.Schema.Types.ObjectId, ref: 'Number' },
-    flowId: { type: mongoose.Schema.Types.ObjectId, ref: 'Flow' },
+    wabaAccountId: { type: mongoose.Schema.Types.ObjectId, ref: 'WhatsAppAccount' },
+    agentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Agent' },
+
     customerPhone: { type: String, required: true },
     customerName: { type: String, default: 'Unknown' },
+
     status: {
       type: String,
       enum: ['active', 'closed', 'pending', 'handed_off'],
       default: 'active',
     },
-    type: {
+    intent: {
       type: String,
-      enum: ['inquiry', 'booking', 'support', 'lead', 'follow_up'],
+      enum: ['inquiry', 'booking', 'reschedule', 'cancellation', 'support', 'other'],
       default: 'inquiry',
     },
+
     messages: [messageSchema],
+
     metadata: {
       lastMessageAt: { type: Date },
       messageCount: { type: Number, default: 0 },
       isAiHandling: { type: Boolean, default: true },
       handedOffTo: { type: String },
-      // Structured lead (real estate): one-line summary + parsed fields for inbox/export
-      leadSummary: { type: String },
-      leadData: {
-        name: { type: String },
-        need: { type: String }, // buy | rent
-        area: { type: String },
-        budget: { type: String },
-        timeline: { type: String },
-      },
+      appointmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Appointment' },
+      summary: { type: String },
     },
   },
   { timestamps: true }

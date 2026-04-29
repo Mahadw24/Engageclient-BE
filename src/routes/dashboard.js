@@ -1,5 +1,6 @@
 import { Conversation } from '../models/conversation.js'
-import { Flow } from '../models/flow.js'
+import { Agent } from '../models/flow.js'
+import { Appointment } from '../models/appointment.js'
 
 export async function dashboardRoutes(fastify) {
   fastify.addHook('onRequest', fastify.authenticate)
@@ -22,24 +23,27 @@ export async function dashboardRoutes(fastify) {
   // Dashboard stats
   fastify.get('/api/dashboard/stats', async (request) => {
     const agencyId = request.user.agencyId
+    const startOfMonth = new Date()
+    startOfMonth.setDate(1)
+    startOfMonth.setHours(0, 0, 0, 0)
 
-    const [totalConversations, activeConversations, totalFlows, activeFlows] = await Promise.all([
+    const [
+      totalConversations,
+      activeConversations,
+      appointmentsBooked,
+      agentCount,
+    ] = await Promise.all([
       Conversation.countDocuments({ agencyId }),
       Conversation.countDocuments({ agencyId, status: 'active' }),
-      Flow.countDocuments({ agencyId }),
-      Flow.countDocuments({ agencyId, active: true }),
+      Appointment.countDocuments({ agencyId, createdAt: { $gte: startOfMonth } }),
+      Agent.countDocuments({ agencyId }),
     ])
-
-    const totalLeads = await Conversation.countDocuments({ agencyId, type: 'lead' })
-    const totalBookings = await Conversation.countDocuments({ agencyId, type: 'booking' })
 
     return {
       totalConversations,
       activeConversations,
-      totalLeads,
-      totalBookings,
-      activeFlows,
-      totalFlows,
+      appointmentsBooked,
+      agentCount,
     }
   })
 

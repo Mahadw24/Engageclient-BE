@@ -1,197 +1,255 @@
-import { validateWebhookSignature, sendWhatsAppMessage } from '../services/twilio.js'
-import { processWithAI } from '../services/ai-agent.js'
-import { NumberModel } from '../models/number.js'
+import { WhatsAppAccount } from '../models/number.js'
+import { Agent } from '../models/flow.js'
 import { Conversation } from '../models/conversation.js'
-import { Flow } from '../models/flow.js'
+import {
+  sendTextMessage,
+  verifySignature,
+  exchangeCodeForToken,
+  getPhoneNumberDetails,
+  subscribeToWebhooks,
+} from '../services/meta-whatsapp.js'
+import { processMessage } from '../services/agent-pipeline.js'
 
 export async function whatsappRoutes(fastify) {
-  // --- Webhook: Receive incoming WhatsApp messages ---
-  fastify.post('/api/whatsapp/webhook', async (request, reply) => {
-    const { Body, From, To, MessageSid, NumMedia, ProfileName } = request.body
 
-    // Validate Twilio signature in production
-    if (process.env.NODE_ENV === 'production') {
-      const signature = request.headers['x-twilio-signature']
-      const url = `${process.env.WEBHOOK_BASE_URL}/api/whatsapp/webhook`
-      if (!validateWebhookSignature(url, request.body, signature)) {
-        return reply.code(403).send({ error: 'Invalid signature' })
-      }
+  // ── Meta Webhook Verification (GET) ────────────────────────────────────────
+  fastify.get('/api/webhooks/whatsapp', async (request, reply) => {
+    const mode      = request.query['hub.mode']
+    const token     = request.query['hub.verify_token']
+    const challenge = request.query['hub.challenge']
+
+    const verifyToken = process.env.META_WHATSAPP_VERIFY_TOKEN || 'engageclient-verify'
+    if (mode === 'subscribe' && token === verifyToken) {
+      fastify.log.info('Meta webhook verified')
+      return reply.code(200).send(challenge)
     }
+    return reply.code(403).send('Forbidden')
+  })
 
-    // Strip "whatsapp:" prefix
-    const fromNumber = From.replace('whatsapp:', '')
-    const toNumber = To.replace('whatsapp:', '')
+  // ── Meta Webhook: Incoming Messages (POST) ──────────────────────────────────
+  fastify.post('/api/webhooks/whatsapp', { config: { rawBody: true } }, async (request, reply) => {
+    // Always respond 200 first — Meta will retry if we don't
+    reply.code(200).send({ received: true })
 
-    fastify.log.info({ msg: 'Incoming WhatsApp', from: fromNumber, to: toNumber, body: Body })
-
-    // Find which agency owns this number
-    const numberDoc = await NumberModel.findOne({ phoneNumber: toNumber }).populate('flowId')
-
-    // --- Sandbox mode: use SANDBOX_FLOW_ID when no number is mapped ---
-    const isSandbox = !numberDoc && process.env.SANDBOX_FLOW_ID
-    let sandboxFlow = null
-
-    if (!numberDoc && !isSandbox) {
-      fastify.log.warn(`No agency mapped to number: ${toNumber}`)
-      reply.type('text/xml').send('<Response></Response>')
-      return
-    }
-
-    if (isSandbox) {
-      sandboxFlow = await Flow.findById(process.env.SANDBOX_FLOW_ID)
-      if (!sandboxFlow) {
-        fastify.log.error(`Sandbox flow not found: ${process.env.SANDBOX_FLOW_ID}`)
-        reply.type('text/xml').send('<Response></Response>')
+    // Verify signature in production
+    if (process.env.NODE_ENV === 'production' && process.env.META_APP_SECRET) {
+      const sig = request.headers['x-hub-signature-256']
+      if (!verifySignature(request.rawBody, sig, process.env.META_APP_SECRET)) {
+        fastify.log.warn('Invalid Meta webhook signature — dropping')
         return
       }
-      fastify.log.info({ msg: 'Sandbox mode', flowId: process.env.SANDBOX_FLOW_ID })
     }
 
-    const agencyId = isSandbox ? sandboxFlow.agencyId : numberDoc.agencyId
-    const activeFlow = isSandbox ? sandboxFlow : numberDoc.flowId
+    const body = request.body
+    if (body?.object !== 'whatsapp_business_account') return
 
-    // Find or create conversation
-    let conversation = await Conversation.findOne({
-      agencyId,
-      customerPhone: fromNumber,
-      status: { $in: ['active', 'pending'] },
-    })
-
-    if (!conversation) {
-      conversation = await Conversation.create({
-        agencyId,
-        numberId: numberDoc?._id,
-        flowId: activeFlow?._id,
-        customerPhone: fromNumber,
-        customerName: ProfileName || 'Unknown',
-        status: 'active',
-        messages: [],
-      })
-    }
-
-    // Save incoming message
-    conversation.messages.push({
-      direction: 'inbound',
-      body: Body,
-      sender: 'customer',
-      twilioSid: MessageSid,
-      status: 'delivered',
-    })
-    conversation.metadata.lastMessageAt = new Date()
-    conversation.metadata.messageCount = conversation.messages.length
-    await conversation.save()
-
-    // Update number stats (skip for sandbox)
-    if (numberDoc) {
-      numberDoc.stats.messagesToday += 1
-      numberDoc.stats.totalMessages += 1
-      await numberDoc.save()
-    }
-
-    // Process with AI if flow exists (sandbox always uses AI, normal checks isAiHandling)
-    const shouldProcessAI = isSandbox
-      ? !!activeFlow
-      : conversation.metadata.isAiHandling && activeFlow
-
-    if (shouldProcessAI) {
-      const aiResult = await processWithAI(activeFlow, conversation)
-
-      if (aiResult) {
-        const isHandoff = typeof aiResult === 'object' && aiResult.handoff
-        const responseText = typeof aiResult === 'object' ? aiResult.text : aiResult
-
-        if (responseText) {
-          try {
-            const result = await sendWhatsAppMessage(toNumber, fromNumber, responseText)
-
-            conversation.messages.push({
-              direction: 'outbound',
-              body: responseText,
-              sender: 'ai',
-              twilioSid: result.sid,
-              status: result.status,
-            })
-            conversation.metadata.lastMessageAt = new Date()
-            conversation.metadata.messageCount = conversation.messages.length
-          } catch (sendErr) {
-            fastify.log.error({ msg: 'Failed to send WhatsApp message', error: sendErr.message, code: sendErr.code })
-            // Save AI response even if send failed
-            conversation.messages.push({
-              direction: 'outbound',
-              body: responseText,
-              sender: 'ai',
-              status: 'failed',
-            })
-          }
-        }
-
-        if (isHandoff) {
-          conversation.metadata.isAiHandling = false
-          conversation.status = 'handed_off'
-        }
-
-        if (typeof aiResult === 'object' && aiResult.leadData) {
-          conversation.metadata.leadSummary = aiResult.leadSummary || null
-          conversation.metadata.leadData = aiResult.leadData
-        }
-
-        await conversation.save()
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        if (change.field !== 'messages') continue
+        await handleMessagesChange(fastify, change.value)
       }
     }
-
-    reply.type('text/xml').send('<Response></Response>')
   })
 
-  // --- Webhook: Message status updates ---
-  fastify.post('/api/whatsapp/status', async (request, reply) => {
-    const { MessageSid, MessageStatus, ErrorCode, ErrorMessage } = request.body
+  // ── Get Connected WhatsApp Account ────────────────────────────────────────
+  fastify.get('/api/whatsapp/account', { onRequest: [fastify.authenticate] }, async (request) => {
+    const account = await WhatsAppAccount.findOne({ agencyId: request.user.agencyId })
+    return { account: account || null }
+  })
 
-    fastify.log.info({
-      msg: 'Status update',
-      sid: MessageSid,
-      status: MessageStatus,
-    })
+  // ── Embedded Signup: Connect WhatsApp Account ──────────────────────────────
+  fastify.post('/api/whatsapp/connect', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    if (!['owner', 'admin'].includes(request.user.role)) {
+      return reply.code(403).send({ error: 'Forbidden' })
+    }
 
-    // Update message status in conversation
-    await Conversation.updateOne(
-      { 'messages.twilioSid': MessageSid },
-      { $set: { 'messages.$.status': MessageStatus } }
+    const { code, wabaId, phoneNumberId } = request.body ?? {}
+    if (!code || !wabaId || !phoneNumberId) {
+      return reply.code(400).send({ error: 'code, wabaId, and phoneNumberId are required' })
+    }
+
+    // Exchange code → user access token
+    const tokenData = await exchangeCodeForToken(code)
+    const accessToken = tokenData.access_token
+
+    // Fetch phone number display info
+    const phoneDetails = await getPhoneNumberDetails(phoneNumberId, accessToken)
+
+    // Subscribe this WABA to our app's webhook
+    await subscribeToWebhooks(wabaId, accessToken)
+
+    // Find the agency's agent to link
+    const agent = await Agent.findOne({ agencyId: request.user.agencyId })
+
+    const waAccount = await WhatsAppAccount.findOneAndUpdate(
+      { agencyId: request.user.agencyId },
+      {
+        agencyId: request.user.agencyId,
+        wabaId,
+        phoneNumberId,
+        accessToken,
+        phoneNumber: phoneDetails.display_phone_number || phoneNumberId,
+        displayName: phoneDetails.verified_name || '',
+        status: 'active',
+        webhookConfigured: true,
+        ...(agent ? { agentId: agent._id } : {}),
+      },
+      { upsert: true, new: true }
     )
 
-    reply.code(200).send({ received: true })
+    fastify.log.info({ msg: 'WhatsApp account connected', agencyId: request.user.agencyId, wabaId })
+    return { success: true, account: waAccount }
   })
 
-  // --- Send a message (from dashboard) ---
-  fastify.post('/api/whatsapp/send', async (request, reply) => {
-    const { conversationId, body, mediaUrl } = request.body
-
+  // ── Manual Send from Inbox (dashboard) ────────────────────────────────────
+  fastify.post('/api/whatsapp/send', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    const { conversationId, body } = request.body ?? {}
     if (!conversationId || !body) {
       return reply.code(400).send({ error: 'conversationId and body are required' })
     }
 
-    const conversation = await Conversation.findById(conversationId).populate('numberId')
-    if (!conversation) {
-      return reply.code(404).send({ error: 'Conversation not found' })
-    }
+    const conversation = await Conversation.findById(conversationId)
+    if (!conversation) return reply.code(404).send({ error: 'Conversation not found' })
 
-    const fromNumber = conversation.numberId?.phoneNumber
-    if (!fromNumber) {
-      return reply.code(400).send({ error: 'No number assigned to this conversation' })
-    }
+    const waAccount = await WhatsAppAccount.findOne({ agencyId: conversation.agencyId })
+    if (!waAccount) return reply.code(404).send({ error: 'No WhatsApp account connected' })
 
-    const result = await sendWhatsAppMessage(fromNumber, conversation.customerPhone, body, { mediaUrl })
+    const sent = await sendTextMessage(waAccount.phoneNumberId, waAccount.accessToken, conversation.customerPhone, body)
 
     conversation.messages.push({
       direction: 'outbound',
       body,
       sender: 'agent',
-      twilioSid: result.sid,
-      status: result.status,
+      waMessageId: sent.messages?.[0]?.id,
+      status: 'sent',
     })
     conversation.metadata.lastMessageAt = new Date()
     conversation.metadata.messageCount = conversation.messages.length
     await conversation.save()
 
-    return result
+    return { success: true }
   })
+}
+
+// ── Internal: process a "messages" change event ─────────────────────────────
+
+async function handleMessagesChange(fastify, value) {
+  // Status updates (delivered, read, failed, etc.)
+  if (value.statuses?.length) {
+    for (const s of value.statuses) {
+      await Conversation.updateOne(
+        { 'messages.waMessageId': s.id },
+        { $set: { 'messages.$.status': s.status } }
+      ).catch(() => {})
+    }
+    return
+  }
+
+  if (!value.messages?.length) return
+
+  const phoneNumberId = value.metadata?.phone_number_id
+  const msg          = value.messages[0]
+  const contact      = value.contacts?.[0]
+
+  // Skip non-text messages (images, audio, etc.) for now
+  if (msg.type !== 'text') return
+
+  const fromNumber   = msg.from
+  const text         = msg.text?.body
+  const waMessageId  = msg.id
+  const customerName = contact?.profile?.name || 'Unknown'
+
+  fastify.log.info({ msg: 'Inbound WhatsApp', from: fromNumber, phoneNumberId, text })
+
+  // Resolve which agency owns this phone number
+  const waAccount = await WhatsAppAccount.findOne({ phoneNumberId })
+  if (!waAccount) {
+    fastify.log.warn(`No WhatsAppAccount for phoneNumberId: ${phoneNumberId}`)
+    return
+  }
+
+  const agencyId = waAccount.agencyId
+
+  // Find or create conversation (re-open if previously closed > 24h ago)
+  let conversation = await Conversation.findOne({
+    agencyId,
+    customerPhone: fromNumber,
+    status: { $in: ['active', 'pending'] },
+  })
+
+  if (!conversation) {
+    conversation = await Conversation.create({
+      agencyId,
+      wabaAccountId: waAccount._id,
+      agentId: waAccount.agentId,
+      customerPhone: fromNumber,
+      customerName,
+      status: 'active',
+      messages: [],
+    })
+    waAccount.stats.totalConversations += 1
+  }
+
+  // Save inbound message
+  conversation.messages.push({
+    direction: 'inbound',
+    body: text,
+    sender: 'customer',
+    waMessageId,
+    status: 'delivered',
+    timestamp: new Date(parseInt(msg.timestamp, 10) * 1000),
+  })
+  conversation.metadata.lastMessageAt = new Date()
+  conversation.metadata.messageCount  = conversation.messages.length
+  await conversation.save()
+
+  waAccount.stats.messagesToday += 1
+  waAccount.stats.totalMessages  += 1
+  await waAccount.save()
+
+  // Skip AI if a human has taken over
+  if (conversation.metadata.isAiHandling === false) return
+
+  // Resolve the agent (linked to account, or first for this agency)
+  const agent = waAccount.agentId
+    ? await Agent.findById(waAccount.agentId)
+    : await Agent.findOne({ agencyId })
+
+  if (!agent) {
+    fastify.log.warn(`No agent configured for agencyId: ${agencyId}`)
+    return
+  }
+
+  // Run AI pipeline
+  const aiResult = await processMessage(agent, conversation)
+  if (!aiResult?.text) return
+
+  try {
+    const sent = await sendTextMessage(phoneNumberId, waAccount.accessToken, fromNumber, aiResult.text)
+
+    conversation.messages.push({
+      direction: 'outbound',
+      body: aiResult.text,
+      sender: 'ai',
+      waMessageId: sent.messages?.[0]?.id,
+      status: 'sent',
+    })
+  } catch (sendErr) {
+    fastify.log.error({ msg: 'Send failed', error: sendErr.message })
+    conversation.messages.push({
+      direction: 'outbound',
+      body: aiResult.text,
+      sender: 'ai',
+      status: 'failed',
+    })
+  }
+
+  if (aiResult.handoff) {
+    conversation.metadata.isAiHandling = false
+    conversation.status = 'handed_off'
+  }
+
+  conversation.metadata.lastMessageAt = new Date()
+  conversation.metadata.messageCount  = conversation.messages.length
+  await conversation.save()
 }
